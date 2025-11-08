@@ -288,6 +288,9 @@ void scheduler_loop() {
     int rr_slice_used = 0;
     int running_proc = -1; // index of currently running process (if scheduler wants to persist)
     int running_start_time = -1;
+    int priority_running_proc = -1;
+    int finished_now = 0;
+
 
     // For SJF non-preemptive we will pick a process and keep it until finished
     int sjf_locked_proc = -1;
@@ -318,7 +321,7 @@ void scheduler_loop() {
             int has_running = 0;
             if (algorithm == ALG_FCFS && running_proc != -1) has_running = 1;
             if (algorithm == ALG_SJF && sjf_locked_proc != -1) has_running = 1;
-            if (algorithm == ALG_RR && running_proc != -1) has_running = 1;
+            if (algorithm == ALG_PRIORITY && priority_running_proc != -1) has_running = 1; // added
             if (!has_running) {
                 if (current_time > 1000) {
                     /* Long idle — dump diagnostic once then exit to avoid spinning forever. */
@@ -372,9 +375,78 @@ void scheduler_loop() {
                 pick = running_proc;
             }
         } else if (algorithm == ALG_PRIORITY) {
-            // Preemptive priority: pick highest priority (ready_insert_ordered keeps ready sorted by priority ascending)
-            pick = ready_pop_front();
+            // ───────────────────────────────────────────────────────────────
+            // Preemptive Priority Scheduling (lower number = higher priority)
+            // ───────────────────────────────────────────────────────────────
+
+            // 1. Reset if current process finished
+            if (priority_running_proc != -1 && processes[priority_running_proc].remaining == 0) {
+                priority_running_proc = -1;
+            }
+
+            // 2. If no process is running and no one is ready, skip this cycle (idle)
+            if (ready_count == 0 && priority_running_proc == -1) {
+                current_time++;
+                continue;
+            }
+
+            // 3. If no one running, pick the highest priority from ready queue
+            if (priority_running_proc == -1) {
+                pick = ready_pop_front();
+                priority_running_proc = pick;
+            } 
+            else {
+                // 4. Check if a higher-priority process has arrived (front of queue)
+                if (ready_count > 0 &&
+                    processes[ready[0]].priority < processes[priority_running_proc].priority) {
+                    // Preempt current process
+                    int preempted = priority_running_proc;
+
+                    // Take higher-priority process
+                    pick = ready_pop_front();
+
+                    // Reinsert preempted process back into ready queue (maintaining order)
+                    ready_insert_ordered(preempted);
+
+                    // Update running process
+                    priority_running_proc = pick;
+                } 
+                else {
+                    // Continue running the same process
+                    pick = priority_running_proc;
+                }
+            }
+
+            // 5. Dispatch the chosen process
+            if (pick == -1) {
+                current_time++;
+                continue;
+            }
+
+            // Run process for 1 unit of time
+            if (!processes[pick].started) {
+                processes[pick].start_time = current_time;
+                processes[pick].started = 1;
+            }
+
+            processes[pick].remaining--;
+            current_time++;
+
+            // 6. Check if it just finished
+            if (processes[pick].remaining == 0) {
+                processes[pick].finish_time = current_time;
+                total_finished++;
+                finished_now = 1;
+
+                // If the finished process was the running one, clear it
+                if (priority_running_proc == pick) {
+                    priority_running_proc = -1;
+                }
+            }
         }
+
+
+
 
         // Sanity
         if (pick < 0 || pick >= proc_count) { current_time++; continue; }
@@ -431,10 +503,14 @@ void scheduler_loop() {
                     // continue running same process next cycle: do nothing
                 }
             } else if (algorithm == ALG_PRIORITY) {
-                // Preemptive priority: after one cycle, reinsert proc into ready queue (it's still runnable)
-                // But we must maintain ordering by priority: insert ordered
-                ready_insert_ordered(pick);
+                if (finished_now) {
+                    total_finished++;
+                    if (priority_running_proc == pick)
+                        priority_running_proc = -1;
+                }
+                // Do not reinsert automatically — only reinsert when preempted above
             }
+
         }
     }
 
