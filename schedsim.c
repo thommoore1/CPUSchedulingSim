@@ -1,6 +1,3 @@
-/* 
-*/
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,34 +128,47 @@ void ready_insert_ordered(int proc_idx) {
     pthread_mutex_lock(&ready_lock);
     ready_ensure_capacity();
     int i = 0;
+
     if (algorithm == ALG_SJF) {
         int r = processes[proc_idx].remaining;
         for (i = 0; i < ready_count; ++i) {
-            if (processes[ready[i]].remaining > r) break;
+            int r2 = processes[ready[i]].remaining;
+            if (r2 > r) break;
+            // tie-breaker: earlier arrival goes first
+            if (r2 == r && processes[ready[i]].arrival > processes[proc_idx].arrival)
+                break;
         }
     } else if (algorithm == ALG_PRIORITY) {
         int pr = processes[proc_idx].priority;
         for (i = 0; i < ready_count; ++i) {
-            if (processes[ready[i]].priority > pr) break;
+            int pr2 = processes[ready[i]].priority;
+            if (pr2 > pr) break;
+            // tie-breaker: if equal priority, earlier arrival first
+            if (pr2 == pr && processes[ready[i]].arrival > processes[proc_idx].arrival)
+                break;
         }
     } else {
         i = ready_count; // append for FCFS/RR default
     }
-    for (int j = ready_count; j > i; --j) ready[j] = ready[j-1];
+
+    for (int j = ready_count; j > i; --j)
+        ready[j] = ready[j - 1];
+
     ready[i] = proc_idx;
     ready_count++;
     pthread_mutex_unlock(&ready_lock);
 }
 
-// Gantt helpers
+// Handles initalization and resizing of gantt array
 void gantt_ensure() {
     if (!gantt_cap) { gantt_cap = 8; gantt = malloc(sizeof(gantt_seg_t)*gantt_cap); }
     else if (gantt_count >= gantt_cap) { gantt_cap *= 2; gantt = realloc(gantt, sizeof(gantt_seg_t)*gantt_cap); }
 }
 
+// Append a segment to Gantt chart
 void gantt_append(int start, int end, const char *pid) {
     if (end <= start) return;
-    // if last segment has same pid and contiguous, extend it
+    // if last segment has same pid and no gap, extend it
     if (gantt_count > 0 && strcmp(gantt[gantt_count-1].pid, pid) == 0 && gantt[gantt_count-1].end == start) {
         gantt[gantt_count-1].end = end;
         return;
@@ -170,7 +180,7 @@ void gantt_append(int start, int end, const char *pid) {
     gantt_count++;
 }
 
-// thread function: wait on sem, simulate 1 unit, update remaining, start/finish times
+// Simulates process executing one time unit per scheduler signal, tracking start and finish times
 void *process_thread(void *arg) {
     int idx = (intptr_t)arg;
     process_t *p = &processes[idx];
@@ -180,7 +190,7 @@ void *process_thread(void *arg) {
     sem_wait(p->sem);
 
         pthread_mutex_lock(&p->lock);
-        // first time starting?
+        // first time starting
         if (!p->started) {
             p->started = 1;
             p->start_time = current_time; // scheduler posts semaphore at this current_time
@@ -202,14 +212,14 @@ void *process_thread(void *arg) {
     return NULL;
 }
 
-// parse CSV line: expect pid,arrival,burst,priority
+// parse CSV line
 int parse_csv_line(char *line, char **pid_out, int *arrival_out, int *burst_out, int *prio_out) {
     // trim newline
     char *p = line;
     char *fields[4] = {0};
     int f = 0;
     char *token;
-    // naive CSV split on commas (no quoting expected)
+    // split by comma
     token = strtok(p, ",");
     while (token && f < 4) {
         while (*token && isspace((unsigned char)*token)) ++token;
@@ -224,6 +234,7 @@ int parse_csv_line(char *line, char **pid_out, int *arrival_out, int *burst_out,
     return 0;
 }
 
+// add process to processes array
 void add_process(const char *pid, int arrival, int burst, int priority) {
     if (proc_count >= capacity) {
         capacity = capacity == 0 ? 8 : capacity * 2;
@@ -240,9 +251,7 @@ void add_process(const char *pid, int arrival, int burst, int priority) {
     processes[i].finish_time = -1;
     processes[i].admitted = 0;
     pthread_mutex_init(&processes[i].lock, NULL);
-    /* Create a unique named semaphore for this process. Use the parent PID
-       and the process index to avoid collisions with previous runs. Named
-       semaphores must begin with '/'. */
+    // Create a unique named semaphore for this process using parent PID and index, retrying if it already exists
     snprintf(processes[i].sem_name, sizeof(processes[i].sem_name), "/schedsim_%d_%d", (int)getpid(), i);
     processes[i].sem = sem_open(processes[i].sem_name, O_CREAT | O_EXCL, 0600, 0);
     if (processes[i].sem == SEM_FAILED) {
@@ -288,20 +297,16 @@ void scheduler_loop() {
     int rr_slice_used = 0;
     int running_proc = -1; // index of currently running process (if scheduler wants to persist)
     int running_start_time = -1;
-    int priority_running_proc = -1;
-    int finished_now = 0;
-
 
     // For SJF non-preemptive we will pick a process and keep it until finished
     int sjf_locked_proc = -1;
 
     // Simulation loop: advance until all processes finished
     while (!all_finished()) {
-        /* (debug prints removed) */
         // 1) Admit arrivals whose arrival <= current_time
         for (int i = 0; i < proc_count; ++i) {
             if (processes[i].arrival <= current_time && processes[i].start_time == -1 && processes[i].remaining == processes[i].burst && !processes[i].admitted) {
-                // arrived but not yet added; we rely on remaining==burst to indicate not seen yet
+                // arrived but not yet added
                 // Add to READY queue according to algorithm
                 if (algorithm == ALG_FCFS || algorithm == ALG_RR) {
                     ready_push_back(i);
@@ -312,16 +317,14 @@ void scheduler_loop() {
                     processes[i].admitted = 1;
                 }
             }
-            // Edge-case: arrival could be <= current_time but we might already have added it earlier; check ready_find_pos prevents double-adding
         }
 
-        // If READY queue empty -> CPU idle for this cycle, unless an algorithm
-        // has a currently-running process that should continue (FCFS/SJF/RR).
+        // If READY queue empty, CPU idle for this cycle, unless an algorithm has a currently-running process that should continue (FCFS/SJF/RR).
         if (ready_count == 0) {
             int has_running = 0;
             if (algorithm == ALG_FCFS && running_proc != -1) has_running = 1;
             if (algorithm == ALG_SJF && sjf_locked_proc != -1) has_running = 1;
-            if (algorithm == ALG_PRIORITY && priority_running_proc != -1) has_running = 1; // added
+            if (algorithm == ALG_RR && running_proc != -1) has_running = 1;
             if (!has_running) {
                 if (current_time > 1000) {
                     /* Long idle — dump diagnostic once then exit to avoid spinning forever. */
@@ -337,8 +340,6 @@ void scheduler_loop() {
                 current_time++;
                 continue;
             }
-            // otherwise: there is a running_proc/sjf_locked_proc to continue even
-            // though ready_count==0, so fall through to selection logic
         }
 
         // 2) Select next process based on algorithm
@@ -375,80 +376,12 @@ void scheduler_loop() {
                 pick = running_proc;
             }
         } else if (algorithm == ALG_PRIORITY) {
-            // ───────────────────────────────────────────────────────────────
-            // Preemptive Priority Scheduling (lower number = higher priority)
-            // ───────────────────────────────────────────────────────────────
-
-            // 1. Reset if current process finished
-            if (priority_running_proc != -1 && processes[priority_running_proc].remaining == 0) {
-                priority_running_proc = -1;
-            }
-
-            // 2. If no process is running and no one is ready, skip this cycle (idle)
-            if (ready_count == 0 && priority_running_proc == -1) {
-                current_time++;
-                continue;
-            }
-
-            // 3. If no one running, pick the highest priority from ready queue
-            if (priority_running_proc == -1) {
-                pick = ready_pop_front();
-                priority_running_proc = pick;
-            } 
-            else {
-                // 4. Check if a higher-priority process has arrived (front of queue)
-                if (ready_count > 0 &&
-                    processes[ready[0]].priority < processes[priority_running_proc].priority) {
-                    // Preempt current process
-                    int preempted = priority_running_proc;
-
-                    // Take higher-priority process
-                    pick = ready_pop_front();
-
-                    // Reinsert preempted process back into ready queue (maintaining order)
-                    ready_insert_ordered(preempted);
-
-                    // Update running process
-                    priority_running_proc = pick;
-                } 
-                else {
-                    // Continue running the same process
-                    pick = priority_running_proc;
-                }
-            }
-
-            // 5. Dispatch the chosen process
-            if (pick == -1) {
-                current_time++;
-                continue;
-            }
-
-            // Run process for 1 unit of time
-            if (!processes[pick].started) {
-                processes[pick].start_time = current_time;
-                processes[pick].started = 1;
-            }
-
-            processes[pick].remaining--;
-            current_time++;
-
-            // 6. Check if it just finished
-            if (processes[pick].remaining == 0) {
-                processes[pick].finish_time = current_time;
-                total_finished++;
-                finished_now = 1;
-
-                // If the finished process was the running one, clear it
-                if (priority_running_proc == pick) {
-                    priority_running_proc = -1;
-                }
-            }
+            // Preemptive priority: pick highest priority (ready_insert_ordered keeps ready sorted by priority ascending)
+            pick = ready_pop_front();
         }
 
+        // skip this cycle if the selected process index is invalid
 
-
-
-        // Sanity
         if (pick < 0 || pick >= proc_count) { current_time++; continue; }
 
         // 3) Dispatch the process: post its semaphore so it executes exactly one cycle
@@ -457,14 +390,11 @@ void scheduler_loop() {
 
         // For Gantt: if switching process, close prior segment and start new
         const char *pidstr = processes[pick].pid;
-        // If last segment has same pid and contiguous, gantt_append will merge
+        // If last segment has same pid and one line, gantt_append will merge
         gantt_append(current_time, current_time+1, pidstr);
 
         // post semaphore
         sem_post(processes[pick].sem);
-
-        // Wait for the process to perform its single cycle. We don't need to join here; thread decrements remaining and continues.
-        // We assume the thread updates its own state; the scheduler simply updates READY queue/metrics based on remaining value.
 
         // Advance time by one cycle (the thread uses current_time to set start/finish; threads see global current_time)
         current_time++;
@@ -484,12 +414,12 @@ void scheduler_loop() {
             if (algorithm == ALG_FCFS && running_proc == pick) running_proc = -1;
             if (algorithm == ALG_SJF && sjf_locked_proc == pick) sjf_locked_proc = -1;
             if (algorithm == ALG_RR && running_proc == pick) running_proc = -1;
-            // For priority: nothing special
+            // For priority
             continue;
         } else {
-            // not finished: for non-preemptive algorithms we may requeue or keep running
+            // not finished: for non-preemptive algorithms may requeue or keep running
             if (algorithm == ALG_FCFS) {
-                // keep running_proc as same; requeue not needed
+                // keep running_proc, requeue not needed
             } else if (algorithm == ALG_SJF) {
                 // keep sjf_locked_proc same
             } else if (algorithm == ALG_RR) {
@@ -503,14 +433,10 @@ void scheduler_loop() {
                     // continue running same process next cycle: do nothing
                 }
             } else if (algorithm == ALG_PRIORITY) {
-                if (finished_now) {
-                    total_finished++;
-                    if (priority_running_proc == pick)
-                        priority_running_proc = -1;
-                }
-                // Do not reinsert automatically — only reinsert when preempted above
+                // after one cycle, reinsert proc into ready queue (it's still runnable)
+                // must maintain ordering by priority: insert ordered
+                ready_insert_ordered(pick);
             }
-
         }
     }
 
@@ -524,12 +450,11 @@ void scheduler_loop() {
 void print_report() {
     printf("===== Schedule Results =====\n\n");
 
-    // Print Gantt chart simple numeric timeline and pid bars
+    // Print Gantt chart numeric timeline and pid bars
     printf("Timeline (Gantt Chart):\n");
     // print time ticks top
     for (int i = 0; i <= gantt_count; ++i) {
-        // no-op: we'll print timeline as segments with start/end and pid below
-        ;
+        // print timeline as segments with start/end and pid below
     }
     // Print segments with times
     for (int i = 0; i < gantt_count; ++i) {
